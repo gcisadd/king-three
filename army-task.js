@@ -1,0 +1,449 @@
+/**
+ * army-task.js
+ * 启动指令 node army-task.js
+ *
+ * 功能：
+ * 1. 检查登录状态
+ * 2. 获取账号列表
+ * 3. 筛选在线且无错误的账号
+ * 4. 调用 army-action
+ * 5. 定时循环执行
+ */
+
+const BASE_URL = 'http://114.67.77.189:18080';
+
+// 登录接口参数
+const LOGIN_PHONE = '17305005500';
+const LOGIN_PASSWORD = 'asdzxc123456';
+
+// 登录成功后从接口响应中动态获取，不在代码中写死 token。
+let AUTH = '';
+
+// ========================
+// 配置
+// ========================
+
+// 每一轮结束后等待时间
+const LOOP_INTERVAL = 30_000;
+
+// 不同账号之间请求间隔
+const ACCOUNT_INTERVAL = 1500;
+
+// 请求超时时间
+const REQUEST_TIMEOUT = 15_000;
+
+// 是否只执行没有 lastError 的账号
+const SKIP_ERROR_ACCOUNT = false;
+
+// 只调用这个账号的 army-action
+const TARGET_ACCOUNT_ID = 2130;
+
+// ========================
+// 工具方法
+// ========================
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function now() {
+  return new Date().toLocaleString();
+}
+
+function log(...args) {
+  console.log(`[${now()}]`, ...args);
+}
+
+function errorLog(...args) {
+  console.error(`[${now()}]`, ...args);
+}
+
+// ========================
+// HTTP 请求
+// ========================
+
+async function request(path, options = {}) {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, REQUEST_TIMEOUT);
+
+  try {
+    const headers = {
+      Accept: 'application/json, text/plain, */*',
+      ...(AUTH
+        ? {
+            Authorization: `Bearer ${AUTH}`,
+            Cookie: `dwsg_session=${AUTH}`,
+          }
+        : {}),
+      ...(options.body !== undefined
+        ? { 'Content-Type': 'application/json' }
+        : {}),
+      ...(options.headers ?? {}),
+    };
+
+    const response = await fetch(`${BASE_URL}${path}`, {
+      method: options.method ?? 'GET',
+      headers,
+      body:
+        options.body === undefined
+          ? undefined
+          : JSON.stringify(options.body),
+      signal: controller.signal,
+    });
+
+    const text = await response.text();
+
+    let data;
+
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text;
+    }
+
+    // 登录失效
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(
+        `AUTH_EXPIRED: HTTP ${response.status}`,
+      );
+    }
+
+    if (!response.ok) {
+      throw new Error(
+        `HTTP ${response.status} ${path}: ${text}`,
+      );
+    }
+
+    return data;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(
+        `请求超时 (${REQUEST_TIMEOUT / 1000}s): ${path}`,
+      );
+    }
+
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ========================
+// API
+// ========================
+
+async function login() {
+  const result = await request('/api/auth/login', {
+    method: 'POST',
+    body: {
+      password: LOGIN_PASSWORD,
+      phone: LOGIN_PHONE,
+    },
+  });
+
+  if (
+    result?.code !== 200 ||
+    typeof result?.data?.token !== 'string' ||
+    !result.data.token
+  ) {
+    throw new Error(
+      `登录接口返回异常: ${JSON.stringify(result)}`,
+    );
+  }
+
+  AUTH = result.data.token;
+
+  return result.data;
+}
+
+async function getAuthInfo() {
+  return request('/api/auth/info');
+}
+
+async function getAccountList() {
+  const result = await request('/api/account/list');
+
+  if (result?.code !== 200) {
+    throw new Error(
+      `account/list 返回异常: ${JSON.stringify(result)}`,
+    );
+  }
+
+  return Array.isArray(result.data)
+    ? result.data
+    : [];
+}
+
+async function armyAction(accountId) {
+  return request(
+    `/api/bot/${accountId}/army-action`,
+  );
+}
+
+// ========================
+// 账号筛选
+// ========================
+
+function isRunnable(account) {
+  // 必须启用
+  if (account.status !== 1) {
+    return false;
+  }
+
+  // 是否跳过带有错误信息的账号
+  if (
+    SKIP_ERROR_ACCOUNT &&
+    account.lastError?.trim()
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+// ========================
+// 执行单个账号
+// ========================
+
+async function executeAccount(account) {
+  const start = Date.now();
+  const shouldOutput = account.id === TARGET_ACCOUNT_ID;
+
+  if (shouldOutput) {
+    log(
+      `开始执行`,
+      `id=${account.id}`,
+      `角色=${account.characterName}`,
+      `服务器=${account.serverName}`,
+    );
+  }
+
+  try {
+    const result = await armyAction(account.id);
+
+    const cost = Date.now() - start;
+
+    if (shouldOutput) {
+      log(
+        `✅ 执行成功`,
+        `id=${account.id}`,
+        `角色=${account.characterName}`,
+        `耗时=${cost}ms`,
+      );
+    }
+
+    const alerts = result?.data?.alerts ?? [];
+
+    if (account.id === TARGET_ACCOUNT_ID) {
+      for (const alert of alerts) {
+        console.log(
+          `[${account.characterName}] ${alert.display}`,
+        );
+      }
+    }
+
+    return true;
+  } catch (error) {
+    const cost = Date.now() - start;
+
+    if (shouldOutput) {
+      errorLog(
+        `❌ 执行失败`,
+        `id=${account.id}`,
+        `角色=${account.characterName}`,
+        `耗时=${cost}ms`,
+        `错误=${error.message}`,
+      );
+    }
+
+    return false;
+  }
+}
+
+// ========================
+// 执行一轮
+// ========================
+
+async function runOnce() {
+  log('');
+  log('================================');
+  log('开始新一轮任务');
+  log('================================');
+
+  // 1. 检查登录
+  const auth = await getAuthInfo();
+
+  if (auth?.code !== 200) {
+    throw new Error(
+      `登录状态异常: ${JSON.stringify(auth)}`,
+    );
+  }
+
+  log(
+    `登录正常`,
+    `用户=${auth.data?.nickname ?? '-'}`,
+    `userId=${auth.data?.userId ?? '-'}`,
+  );
+
+  // 2. 获取账号
+  const accounts = await getAccountList();
+
+  log(`获取账号数量: ${accounts.length}`);
+
+  // 3. 筛选
+  const runnableAccounts =
+    accounts.filter(isRunnable);
+
+  log(
+    `本轮可执行账号: ${runnableAccounts.length}`,
+  );
+
+  const targetAccounts = runnableAccounts.filter(
+    account => account.id === TARGET_ACCOUNT_ID,
+  );
+
+  log(
+    `本轮目标账号: ${targetAccounts.length}`,
+  );
+
+  if (targetAccounts.length === 0) {
+    log('当前没有符合条件的账号');
+    return;
+  }
+
+  // 显示准备执行的账号
+  for (const account of targetAccounts) {
+    log(
+      `  - ${account.characterName}`,
+      `id=${account.id}`,
+      account.serverName,
+    );
+  }
+
+  let successCount = 0;
+  let failedCount = 0;
+
+  // 4. 顺序执行
+  for (
+    let i = 0;
+    i < targetAccounts.length;
+    i++
+  ) {
+    const account = targetAccounts[i];
+
+    const success =
+      await executeAccount(account);
+
+    if (success) {
+      successCount++;
+    } else {
+      failedCount++;
+    }
+
+    // 最后一个账号执行完成之后不等待
+    if (i < targetAccounts.length - 1) {
+      await sleep(ACCOUNT_INTERVAL);
+    }
+  }
+
+  log('');
+  log(
+    `本轮完成`,
+    `成功=${successCount}`,
+    `失败=${failedCount}`,
+  );
+}
+
+// ========================
+// 主循环
+// ========================
+
+async function main() {
+  log('Army Action 自动任务启动');
+
+  const loginInfo = await login();
+
+  log(
+    `登录成功`,
+    `用户=${loginInfo.nickname ?? '-'}`,
+    `userId=${loginInfo.userId ?? '-'}`,
+  );
+
+  log(
+    `循环间隔: ${LOOP_INTERVAL / 1000}s`,
+  );
+
+  log(
+    `账号间隔: ${ACCOUNT_INTERVAL / 1000}s`,
+  );
+
+  while (true) {
+    try {
+      await runOnce();
+    } catch (error) {
+      errorLog(
+        '本轮任务发生异常:',
+        error.message,
+      );
+
+      // Token / Session 失效
+      if (
+        error.message.includes('AUTH_EXPIRED')
+      ) {
+        errorLog('');
+        errorLog(
+          '认证信息已经失效，正在重新登录。',
+        );
+
+        const loginInfo = await login();
+
+        log(
+          `重新登录成功`,
+          `用户=${loginInfo.nickname ?? '-'}`,
+          `userId=${loginInfo.userId ?? '-'}`,
+        );
+
+        continue;
+      }
+    }
+
+    log(
+      `等待 ${LOOP_INTERVAL / 1000} 秒后执行下一轮...`,
+    );
+
+    await sleep(LOOP_INTERVAL);
+  }
+}
+
+// ========================
+// 优雅退出
+// ========================
+
+process.on('SIGINT', () => {
+  log('');
+  log('收到退出信号，任务停止。');
+
+  process.exit(0);
+});
+
+process.on(
+  'unhandledRejection',
+  error => {
+    errorLog(
+      'Unhandled rejection:',
+      error,
+    );
+  },
+);
+
+main().catch(error => {
+  errorLog(
+    '程序启动失败:',
+    error,
+  );
+
+  process.exit(1);
+});
