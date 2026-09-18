@@ -25,8 +25,9 @@ mkdir -p \
 clang \
   -arch "$ARCH" \
   -O2 \
+  -framework Cocoa \
   -o "$APP_BUNDLE/Contents/MacOS/ArmyTask" \
-  "$PROJECT_ROOT/macos/ArmyTaskLauncher.c"
+  "$PROJECT_ROOT/macos/ArmyTaskLauncher.m"
 
 npx --yes @yao-pkg/pkg \
   -t "$TARGET" \

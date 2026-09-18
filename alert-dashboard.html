@@ -233,8 +233,12 @@
     function allRecords() { return state.groups.flat(); }
 
     function loadOwners() {
+      const ownerSelect = $('ownerSelect');
+
+      if (!ownerSelect) return;
+
       const owners = [...new Set(state.groups.map(groupOwner))].sort((a, b) => a.localeCompare(b, 'zh-CN'));
-      $('ownerSelect').innerHTML = '<option value="">全部</option>' + owners
+      ownerSelect.innerHTML = '<option value="">全部</option>' + owners
         .map(owner => `<option value="${escapeHtml(owner)}">${escapeHtml(owner)}</option>`)
         .join('');
     }
@@ -250,8 +254,8 @@
     }
 
     function matches(group) {
-      const keyword = $('searchInput').value.trim().toLowerCase();
-      const owner = $('ownerSelect').value;
+      const keyword = $('searchInput')?.value.trim().toLowerCase() || '';
+      const owner = $('ownerSelect')?.value || '';
       if (owner && groupOwner(group) !== owner) return false;
       if (!keyword) return true;
       return JSON.stringify(group).toLowerCase().includes(keyword);
@@ -352,8 +356,8 @@
     }
 
     $('refreshButton').addEventListener('click', loadAlerts);
-    $('searchInput').addEventListener('input', renderGroups);
-    $('ownerSelect').addEventListener('change', renderGroups);
+    $('searchInput')?.addEventListener('input', renderGroups);
+    $('ownerSelect')?.addEventListener('change', renderGroups);
     $('autoRefresh').addEventListener('change', event => {
       restartAutoRefresh();
     });
