@@ -1,0 +1,17 @@
+{
+  "name": "army-task",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Army Action task runner and alert dashboard",
+  "bin": "army-task.js",
+  "scripts": {
+    "build:win": "npx --yes @yao-pkg/pkg -t node24-win-x64 -o dist/army-task.exe army-task.js",
+    "build:mac-app": "bash scripts/build-macos-app.sh arm64",
+    "build:mac-app:intel": "bash scripts/build-macos-app.sh x64"
+  },
+  "pkg": {
+    "assets": [
+      "alert-dashboard.html"
+    ]
+  }
+}
