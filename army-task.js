@@ -10,6 +10,9 @@
  * 5. 定时循环执行
  */
 
+const fs = require('node:fs/promises');
+const path = require('node:path');
+
 const BASE_URL = 'http://114.67.77.189:18080';
 
 // 登录接口参数
@@ -26,6 +29,15 @@ let AUTH = '';
 // 每一轮结束后等待时间
 const LOOP_INTERVAL = 30_000;
 
+// alert 日志写入间隔
+const ALERT_LOG_INTERVAL = 30 * 60 * 1000;
+
+// alert 日志最多保存组数（每次接口获取的数据为一组）
+const MAX_ALERT_LOG_GROUPS = 200;
+
+// alert 日志文件（与当前脚本同目录）
+const ALERT_LOG_FILE = path.join(__dirname, 'alert-logs');
+
 // 不同账号之间请求间隔
 const ACCOUNT_INTERVAL = 1500;
 
@@ -37,6 +49,11 @@ const SKIP_ERROR_ACCOUNT = false;
 
 // 只调用这个账号的 army-action
 const TARGET_ACCOUNT_ID = 2130;
+
+// 等待下次定时写入的 alert 组
+let pendingAlertLogGroups = [];
+let alertLogTimer;
+let alertFlushPromise;
 
 // ========================
 // 工具方法
@@ -56,6 +73,128 @@ function log(...args) {
 
 function errorLog(...args) {
   console.error(`[${now()}]`, ...args);
+}
+
+function queueAlertLogs(alerts, account) {
+  if (alerts.length === 0) {
+    return;
+  }
+
+  const fetchedAt = new Date().toISOString();
+  const alertGroup = alerts.map(alert => ({
+    time: fetchedAt,
+    accountId: account.id,
+    characterName: account.characterName ?? '',
+    serverName: account.serverName ?? '',
+    alert,
+  }));
+
+  pendingAlertLogGroups.push(alertGroup);
+}
+
+async function readAlertLogs() {
+  try {
+    const content = await fs.readFile(
+      ALERT_LOG_FILE,
+      'utf8',
+    );
+
+    if (!content.trim()) {
+      return [];
+    }
+
+    const logs = JSON.parse(content);
+
+    if (!Array.isArray(logs)) {
+      throw new Error('alert-logs 文件内容不是数组');
+    }
+
+    // 兼容旧版“所有 alert 平铺在同一个数组”的格式
+    return logs.map(log => {
+      if (Array.isArray(log)) {
+        return log;
+      }
+
+      if (log && typeof log === 'object') {
+        return [log];
+      }
+
+      throw new Error('alert-logs 文件包含无效记录');
+    });
+  } catch (error) {
+    if (error.code === 'ENOENT') {
+      return [];
+    }
+
+    throw error;
+  }
+}
+
+async function writePendingAlertLogs() {
+  if (pendingAlertLogGroups.length === 0) {
+    return;
+  }
+
+  const newGroups = pendingAlertLogGroups;
+  pendingAlertLogGroups = [];
+
+  try {
+    const oldLogs = await readAlertLogs();
+    const logs = [
+      ...oldLogs,
+      ...newGroups,
+    ].slice(-MAX_ALERT_LOG_GROUPS);
+
+    const tempFile = `${ALERT_LOG_FILE}.${process.pid}.tmp`;
+
+    await fs.writeFile(
+      tempFile,
+      `${JSON.stringify(logs, null, 2)}\n`,
+      'utf8',
+    );
+    await fs.rename(tempFile, ALERT_LOG_FILE);
+
+    log(
+      `alert 已写入 ${path.basename(ALERT_LOG_FILE)}`,
+      `新增组数=${newGroups.length}`,
+      `新增alert=${newGroups.reduce((total, group) => total + group.length, 0)}`,
+      `保留组数=${logs.length}`,
+    );
+  } catch (error) {
+    // 写入失败时恢复到队列，避免 alert 丢失
+    pendingAlertLogGroups = [
+      ...newGroups,
+      ...pendingAlertLogGroups,
+    ];
+
+    throw error;
+  }
+}
+
+async function flushAlertLogs() {
+  // 避免定时写入和退出时写入同时操作同一个文件
+  if (alertFlushPromise) {
+    return alertFlushPromise;
+  }
+
+  alertFlushPromise = writePendingAlertLogs();
+
+  try {
+    await alertFlushPromise;
+  } finally {
+    alertFlushPromise = undefined;
+  }
+}
+
+function startAlertLogWriter() {
+  alertLogTimer = setInterval(() => {
+    flushAlertLogs().catch(error => {
+      errorLog(
+        'alert 写入失败:',
+        error.message,
+      );
+    });
+  }, ALERT_LOG_INTERVAL);
 }
 
 // ========================
@@ -235,7 +374,11 @@ async function executeAccount(account) {
       );
     }
 
-    const alerts = result?.data?.alerts ?? [];
+    const alerts = Array.isArray(result?.data?.alerts)
+      ? result.data.alerts
+      : [];
+
+    queueAlertLogs(alerts, account);
 
     if (account.id === TARGET_ACCOUNT_ID) {
       for (const alert of alerts) {
@@ -380,6 +523,12 @@ async function main() {
     `账号间隔: ${ACCOUNT_INTERVAL / 1000}s`,
   );
 
+  log(
+    `alert 写入间隔: ${ALERT_LOG_INTERVAL / 60_000} 分钟`,
+  );
+
+  startAlertLogWriter();
+
   while (true) {
     try {
       await runOnce();
@@ -422,9 +571,22 @@ async function main() {
 // 优雅退出
 // ========================
 
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
+  if (alertLogTimer) {
+    clearInterval(alertLogTimer);
+  }
+
   log('');
   log('收到退出信号，任务停止。');
+
+  try {
+    await flushAlertLogs();
+  } catch (error) {
+    errorLog(
+      '退出前写入 alert 失败:',
+      error.message,
+    );
+  }
 
   process.exit(0);
 });
